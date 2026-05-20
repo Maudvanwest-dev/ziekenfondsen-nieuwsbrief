@@ -1,0 +1,6 @@
+# Lijst van e-mailadressen die de nieuwsbrief ontvangen.
+# Één adres per regel. Regels die beginnen met # worden genegeerd.
+# Voeg echte adressen toe vóór u het script uitvoert.
+
+abonnee1@example.com
+abonnee2@example.com

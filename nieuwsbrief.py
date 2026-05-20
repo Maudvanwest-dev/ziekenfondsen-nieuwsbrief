@@ -1,36 +1,45 @@
 """
-Wekelijkse ziekenfondsen-nieuwsbrief via Tavily + Gmail SMTP.
+Wekelijkse ziekenfondsen-nieuwsbrief via Tavily + Resend.
 
 Vereiste omgevingsvariabelen:
-  TAVILY_API_KEY   – Tavily Search API key
-  GMAIL_USER       – Gmail-adres dat verzendt (bijv. yourname@gmail.com)
-  GMAIL_APP_PASS   – Gmail app-wachtwoord (niet het gewone wachtwoord)
+  TAVILY_API_KEY  – Tavily Search API key
+  RESEND_API_KEY  – Resend API key
+  FROM_EMAIL      – Geverifieerd afzenderadres in Resend (bijv. nieuwsbrief@jouwedomein.be)
+  UNSUBSCRIBE_EMAIL – Adres voor uitschrijfverzoeken (bijv. uitschrijven@jouwedomein.be)
+
+Abonnees: subscribers.txt (één e-mailadres per regel; regels met # worden genegeerd).
+Cron job: 0 8 * * 1  →  elke maandag om 08:00 lokale tijd
 """
 
 import os
-import smtplib
-import textwrap
+import sys
 from datetime import date
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+from urllib.parse import quote
 
+import resend
 from tavily import TavilyClient
 
 # ---------------------------------------------------------------------------
 # Configuratie
 # ---------------------------------------------------------------------------
 
-RECIPIENT = "maud.vanwest@cm.be"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SUBSCRIBERS_FILE = os.path.join(SCRIPT_DIR, "subscribers.txt")
+
+FROM_EMAIL = os.environ.get("FROM_EMAIL", "nieuwsbrief@example.com")
+UNSUBSCRIBE_EMAIL = os.environ.get("UNSUBSCRIBE_EMAIL", "uitschrijven@example.com")
+
 SUBJECT = f"Ziekenfondsen in de media – week van {date.today().strftime('%d %B %Y')}"
 
 SEARCH_QUERIES: dict[str, list[str]] = {
     "politiek": [
         "ziekenfonds hervorming",
         "mutualiteit afschaffen",
+        "ziekteverzekering Vlaams",
     ],
     "media": [
         "ziekenfonds kritiek",
-        "CM Solidaris Helan",
+        "CM Solidaris Helan onder vuur",
     ],
     "reactie": [
         "CM reageert",
@@ -38,13 +47,12 @@ SEARCH_QUERIES: dict[str, list[str]] = {
     ],
 }
 
-# Zoek alleen Nederlandstalige / Vlaamse bronnen
 SEARCH_KWARGS = {
     "search_depth": "advanced",
     "max_results": 3,
     "include_domains": [
         "vrt.be", "de-standaard.be", "hln.be", "knack.be",
-        "nieuwsblad.be", "apache.be", "mo.be", "rtbf.be",
+        "nieuwsblad.be", "apache.be", "mo.be",
         "tijd.be", "humo.be",
     ],
     "days": 7,
@@ -64,11 +72,28 @@ CATEGORY_COLORS = {
 
 
 # ---------------------------------------------------------------------------
-# Hulpfuncties
+# Abonnees inlezen
+# ---------------------------------------------------------------------------
+
+def load_subscribers() -> list[str]:
+    """Lees e-mailadressen uit subscribers.txt (één per regel)."""
+    if not os.path.exists(SUBSCRIBERS_FILE):
+        print(f"[WARN] {SUBSCRIBERS_FILE} niet gevonden.")
+        return []
+    with open(SUBSCRIBERS_FILE, encoding="utf-8") as f:
+        return [
+            line.strip()
+            for line in f
+            if line.strip() and not line.startswith("#")
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Tavily-zoekopdrachten
 # ---------------------------------------------------------------------------
 
 def summarise(content: str) -> str:
-    """Geef de eerste twee volzinnen van een tekst terug als samenvatting."""
+    """Geef de eerste twee volzinnen terug als samenvatting."""
     sentences = [s.strip() for s in content.replace("\n", " ").split(".") if s.strip()]
     summary = ". ".join(sentences[:2])
     return (summary + ".") if summary else "Geen samenvatting beschikbaar."
@@ -91,16 +116,13 @@ def search_category(client: TavilyClient, category: str, queries: list[str]) -> 
             if url in seen:
                 continue
             seen.add(url)
-            articles.append(
-                {
-                    "title":    result.get("title", "(geen titel)"),
-                    "url":      url,
-                    "summary":  summarise(result.get("content", "")),
-                    "source":   result.get("url", "").split("/")[2] if url else "",
-                    "category": category,
-                    "query":    query,
-                }
-            )
+            articles.append({
+                "title":   result.get("title", "(geen titel)"),
+                "url":     url,
+                "summary": summarise(result.get("content", "")),
+                "source":  url.split("/")[2] if url else "",
+                "query":   query,
+            })
 
     return articles
 
@@ -124,36 +146,42 @@ ARTICLE_TEMPLATE = """\
 """
 
 SECTION_TEMPLATE = """\
-<table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:28px; border-radius:6px; overflow:hidden; border:1px solid #e8e8e8;">
+<table width="100%" cellpadding="0" cellspacing="0"
+       style="margin-bottom:28px; border-radius:6px; overflow:hidden; border:1px solid #e8e8e8;">
   <tr>
     <td style="background:{color}; padding:10px 16px;">
-      <h2 style="margin:0; font-size:15px; font-weight:700; color:#fff; text-transform:uppercase; letter-spacing:0.5px;">
+      <h2 style="margin:0; font-size:15px; font-weight:700; color:#fff;
+                 text-transform:uppercase; letter-spacing:0.5px;">
         {label}
       </h2>
     </td>
   </tr>
   {article_rows}
-  {empty_row}
 </table>
 """
 
-EMPTY_ROW = """\
-<tr>
-  <td style="padding:12px 16px; color:#999; font-size:13px; font-style:italic;">
-    Geen nieuwe artikels gevonden deze week.
-  </td>
-</tr>
+NO_ARTICLES_NOTICE = """\
+<p style="font-size:14px; color:#888; font-style:italic; text-align:center; padding:16px 0;">
+  Geen recente artikels gevonden deze week.
+</p>
 """
 
 HTML_WRAPPER = """\
 <!DOCTYPE html>
 <html lang="nl">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="margin:0; padding:0; background:#f5f5f5; font-family:'Helvetica Neue',Arial,sans-serif;">
-<table width="100%" cellpadding="0" cellspacing="0" style="background:#f5f5f5; padding:24px 0;">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+</head>
+<body style="margin:0; padding:0; background:#f5f5f5;
+             font-family:'Helvetica Neue',Arial,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0"
+       style="background:#f5f5f5; padding:24px 0;">
   <tr>
     <td align="center">
-      <table width="620" cellpadding="0" cellspacing="0" style="background:#fff; border-radius:8px; overflow:hidden; box-shadow:0 2px 8px rgba(0,0,0,0.08);">
+      <table width="620" cellpadding="0" cellspacing="0"
+             style="background:#fff; border-radius:8px; overflow:hidden;
+                    box-shadow:0 2px 8px rgba(0,0,0,0.08);">
 
         <!-- Header -->
         <tr>
@@ -162,7 +190,8 @@ HTML_WRAPPER = """\
               Ziekenfondsen in de media
             </h1>
             <p style="margin:6px 0 0; color:#a8c5e8; font-size:13px;">
-              Automatisch gegenereerd op {date} &nbsp;&bull;&nbsp; Vlaamse mediaberichtgeving
+              Automatisch gegenereerd op {date}
+              &nbsp;&bull;&nbsp; Vlaamse mediaberichtgeving
             </p>
           </td>
         </tr>
@@ -176,10 +205,18 @@ HTML_WRAPPER = """\
 
         <!-- Footer -->
         <tr>
-          <td style="background:#f8f8f8; padding:16px 32px; border-top:1px solid #e8e8e8;">
+          <td style="background:#f8f8f8; padding:16px 32px;
+                     border-top:1px solid #e8e8e8;">
+            <p style="margin:0 0 6px; font-size:11px; color:#aaa;">
+              Dit is een automatisch gegenereerde nieuwsbrief. Bronnen worden
+              wekelijks opgehaald via Tavily Search.
+            </p>
             <p style="margin:0; font-size:11px; color:#aaa;">
-              Dit is een automatisch gegenereerde nieuwsbrief. Bronnen worden wekelijks opgehaald via Tavily Search.
-              De samenvatting is gebaseerd op de beschikbare tekst uit de zoekresultaten.
+              Wilt u deze nieuwsbrief niet meer ontvangen?
+              <a href="mailto:{unsubscribe_email}?subject=Uitschrijven&amp;body=Schrijf%20mij%20uit%3A%20{encoded_recipient}"
+                 style="color:#888; text-decoration:underline;">
+                Klik hier om u uit te schrijven.
+              </a>
             </p>
           </td>
         </tr>
@@ -193,49 +230,45 @@ HTML_WRAPPER = """\
 """
 
 
-def build_html(results: dict[str, list[dict]]) -> str:
+def build_html(results: dict[str, list[dict]], recipient_email: str) -> str:
     sections_html = ""
 
     for category, label in CATEGORY_LABELS.items():
         articles = results.get(category, [])
-        article_rows = "".join(
-            ARTICLE_TEMPLATE.format(**a) for a in articles
-        )
-        empty_row = "" if articles else EMPTY_ROW
+        if not articles:
+            continue  # Lege rubrieken worden volledig weggelaten
 
+        article_rows = "".join(ARTICLE_TEMPLATE.format(**a) for a in articles)
         sections_html += SECTION_TEMPLATE.format(
             color=CATEGORY_COLORS[category],
             label=label,
             article_rows=article_rows,
-            empty_row=empty_row,
         )
+
+    if not sections_html:
+        sections_html = NO_ARTICLES_NOTICE
 
     return HTML_WRAPPER.format(
         date=date.today().strftime("%d %B %Y"),
         sections=sections_html,
+        unsubscribe_email=UNSUBSCRIBE_EMAIL,
+        encoded_recipient=quote(recipient_email),
     )
 
 
 # ---------------------------------------------------------------------------
-# E-mail verzenden
+# Verzenden via Resend
 # ---------------------------------------------------------------------------
 
-def send_email(html_body: str, smtp_user: str, smtp_pass: str) -> None:
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = SUBJECT
-    msg["From"] = smtp_user
-    msg["To"] = RECIPIENT
-
-    # Tekstversie als fallback
-    plain = "Ziekenfondsen in de media – open in een HTML-compatibele e-mailclient."
-    msg.attach(MIMEText(plain, "plain", "utf-8"))
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
-
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(smtp_user, smtp_pass)
-        server.sendmail(smtp_user, RECIPIENT, msg.as_string())
-
-    print(f"[OK] E-mail verstuurd naar {RECIPIENT}")
+def send_newsletter(html_body: str, recipient: str) -> None:
+    params: resend.Emails.SendParams = {
+        "from": FROM_EMAIL,
+        "to": [recipient],
+        "subject": SUBJECT,
+        "html": html_body,
+    }
+    response = resend.Emails.send(params)
+    print(f"[OK] Verstuurd naar {recipient} (id: {response.get('id', '?')})")
 
 
 # ---------------------------------------------------------------------------
@@ -245,14 +278,19 @@ def send_email(html_body: str, smtp_user: str, smtp_pass: str) -> None:
 def main() -> None:
     tavily_key = os.environ.get("TAVILY_API_KEY")
     if not tavily_key:
-        raise EnvironmentError("Omgevingsvariabele TAVILY_API_KEY is niet ingesteld.")
+        sys.exit("[FOUT] Omgevingsvariabele TAVILY_API_KEY is niet ingesteld.")
 
-    gmail_user = os.environ.get("GMAIL_USER")
-    gmail_pass = os.environ.get("GMAIL_APP_PASS")
-    if not gmail_user or not gmail_pass:
-        raise EnvironmentError(
-            "Omgevingsvariabelen GMAIL_USER en GMAIL_APP_PASS zijn vereist."
-        )
+    resend_key = os.environ.get("RESEND_API_KEY")
+    if not resend_key:
+        sys.exit("[FOUT] Omgevingsvariabele RESEND_API_KEY is niet ingesteld.")
+
+    resend.api_key = resend_key
+
+    subscribers = load_subscribers()
+    if not subscribers:
+        sys.exit("[FOUT] Geen abonnees gevonden in subscribers.txt.")
+
+    print(f"Abonnees: {len(subscribers)}")
 
     client = TavilyClient(api_key=tavily_key)
 
@@ -261,11 +299,18 @@ def main() -> None:
     for category, queries in SEARCH_QUERIES.items():
         print(f"  [{category}] {queries}")
         results[category] = search_category(client, category, queries)
-        total = len(results[category])
-        print(f"  → {total} artikel(en) gevonden")
+        print(f"  → {len(results[category])} artikel(en) gevonden")
 
-    html = build_html(results)
-    send_email(html, gmail_user, gmail_pass)
+    active_categories = [c for c in CATEGORY_LABELS if results.get(c)]
+    print(f"Actieve rubrieken: {active_categories or ['geen']}")
+
+    print("Nieuwsbrieven versturen…")
+    for email in subscribers:
+        try:
+            html = build_html(results, email)
+            send_newsletter(html, email)
+        except Exception as exc:
+            print(f"[FOUT] Kon niet versturen naar {email}: {exc}")
 
 
 if __name__ == "__main__":
